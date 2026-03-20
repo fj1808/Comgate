@@ -2506,157 +2506,621 @@ async def get_opcda_client_data(
 # ==================== POLLING ENGINE ====================
 polling_tasks = {}
 
+# Device connection pool for real Modbus polling
+device_connections: Dict[str, Any] = {}
+
+class RealModbusPoller:
+    """Handles real Modbus TCP/UDP connections for a device"""
+    
+    def __init__(self, device: dict):
+        self.device = device
+        self.client = None
+        self.is_connected = False
+        self.last_error = None
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 3
+    
+    async def connect(self) -> bool:
+        """Connect to the real Modbus device"""
+        try:
+            protocol = self.device.get('protocol', 'tcp')
+            ip = self.device.get('ip_address')
+            port = self.device.get('port', 502)
+            
+            if not ip:
+                self.last_error = "No IP address configured"
+                return False
+            
+            if protocol == 'tcp':
+                self.client = AsyncModbusTcpClient(
+                    host=ip,
+                    port=port,
+                    timeout=self.device.get('timeout_ms', 3000) / 1000.0
+                )
+            elif protocol == 'udp':
+                self.client = AsyncModbusUdpClient(
+                    host=ip,
+                    port=port,
+                    timeout=self.device.get('timeout_ms', 3000) / 1000.0
+                )
+            else:
+                self.last_error = f"Unsupported protocol: {protocol}"
+                return False
+            
+            connected = await self.client.connect()
+            self.is_connected = connected
+            if connected:
+                self.last_error = None
+                self.reconnect_attempts = 0
+                logger.info(f"Connected to device {self.device['name']} at {ip}:{port}")
+            else:
+                self.last_error = f"Failed to connect to {ip}:{port}"
+            return connected
+        except Exception as e:
+            self.last_error = str(e)
+            self.is_connected = False
+            logger.error(f"Connection error for {self.device['name']}: {e}")
+            return False
+    
+    async def disconnect(self):
+        """Disconnect from device"""
+        if self.client:
+            try:
+                self.client.close()
+            except:
+                pass
+        self.is_connected = False
+        self.client = None
+    
+    async def ensure_connected(self) -> bool:
+        """Ensure connection is established, reconnect if needed"""
+        if self.is_connected and self.client:
+            return True
+        
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            return False
+        
+        self.reconnect_attempts += 1
+        return await self.connect()
+    
+    async def read_registers(self, obj_type: str, address: int, count: int, unit_id: int) -> tuple:
+        """Read registers from device. Returns (values, error)"""
+        if not await self.ensure_connected():
+            return None, self.last_error or "Not connected"
+        
+        try:
+            if obj_type == ObjectType.COIL.value:
+                result = await self.client.read_coils(address, count, slave=unit_id)
+            elif obj_type == ObjectType.DISCRETE_INPUT.value:
+                result = await self.client.read_discrete_inputs(address, count, slave=unit_id)
+            elif obj_type == ObjectType.INPUT_REGISTER.value:
+                result = await self.client.read_input_registers(address, count, slave=unit_id)
+            elif obj_type == ObjectType.HOLDING_REGISTER.value:
+                result = await self.client.read_holding_registers(address, count, slave=unit_id)
+            else:
+                return None, f"Unknown object type: {obj_type}"
+            
+            if result.isError():
+                self.is_connected = False
+                return None, f"Modbus error: {result}"
+            
+            # Extract values based on type
+            if obj_type in [ObjectType.COIL.value, ObjectType.DISCRETE_INPUT.value]:
+                return list(result.bits[:count]), None
+            else:
+                return list(result.registers), None
+                
+        except Exception as e:
+            self.is_connected = False
+            self.last_error = str(e)
+            return None, str(e)
+    
+    async def write_register(self, obj_type: str, address: int, value: Any, unit_id: int) -> tuple:
+        """Write to device. Returns (success, error)"""
+        if not await self.ensure_connected():
+            return False, self.last_error or "Not connected"
+        
+        try:
+            if obj_type == ObjectType.COIL.value:
+                result = await self.client.write_coil(address, bool(value), slave=unit_id)
+            elif obj_type == ObjectType.HOLDING_REGISTER.value:
+                result = await self.client.write_register(address, int(value) & 0xFFFF, slave=unit_id)
+            else:
+                return False, f"Cannot write to {obj_type}"
+            
+            if result.isError():
+                return False, f"Modbus write error: {result}"
+            
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+    
+    async def write_registers(self, obj_type: str, address: int, values: List[int], unit_id: int) -> tuple:
+        """Write multiple registers. Returns (success, error)"""
+        if not await self.ensure_connected():
+            return False, self.last_error or "Not connected"
+        
+        try:
+            if obj_type == ObjectType.COIL.value:
+                result = await self.client.write_coils(address, [bool(v) for v in values], slave=unit_id)
+            elif obj_type == ObjectType.HOLDING_REGISTER.value:
+                result = await self.client.write_registers(address, [int(v) & 0xFFFF for v in values], slave=unit_id)
+            else:
+                return False, f"Cannot write to {obj_type}"
+            
+            if result.isError():
+                return False, f"Modbus write error: {result}"
+            
+            return True, None
+        except Exception as e:
+            self.last_error = str(e)
+            return False, str(e)
+
+
+def decode_modbus_value(raw_registers: List[int], data_type: str, endian: str = 'ABCD') -> Any:
+    """Decode raw Modbus registers to actual value based on data type and endianness"""
+    if not raw_registers:
+        return None
+    
+    if data_type == 'bool':
+        return bool(raw_registers[0])
+    elif data_type == 'uint16':
+        return raw_registers[0]
+    elif data_type == 'int16':
+        val = raw_registers[0]
+        return val if val < 32768 else val - 65536
+    elif data_type in ['uint32', 'int32', 'float32']:
+        if len(raw_registers) < 2:
+            return raw_registers[0] if raw_registers else 0
+        
+        # Get bytes based on endianness
+        if endian == 'ABCD':  # Big-endian
+            bytes_val = struct.pack('>HH', raw_registers[0], raw_registers[1])
+        elif endian == 'CDAB':  # Little-endian word swap
+            bytes_val = struct.pack('>HH', raw_registers[1], raw_registers[0])
+        elif endian == 'BADC':  # Big-endian byte swap
+            bytes_val = struct.pack('<HH', raw_registers[0], raw_registers[1])
+        elif endian == 'DCBA':  # Little-endian
+            bytes_val = struct.pack('<HH', raw_registers[1], raw_registers[0])
+        else:
+            bytes_val = struct.pack('>HH', raw_registers[0], raw_registers[1])
+        
+        if data_type == 'uint32':
+            return struct.unpack('>I', bytes_val)[0]
+        elif data_type == 'int32':
+            return struct.unpack('>i', bytes_val)[0]
+        elif data_type == 'float32':
+            return struct.unpack('>f', bytes_val)[0]
+    elif data_type == 'float64':
+        if len(raw_registers) < 4:
+            return 0.0
+        # Combine 4 registers for 64-bit float
+        if endian == 'ABCD':
+            bytes_val = struct.pack('>HHHH', *raw_registers[:4])
+        else:
+            bytes_val = struct.pack('>HHHH', *raw_registers[:4])
+        return struct.unpack('>d', bytes_val)[0]
+    
+    return raw_registers[0] if raw_registers else 0
+
+
+def encode_modbus_value(value: Any, data_type: str, endian: str = 'ABCD') -> List[int]:
+    """Encode a value to raw Modbus registers"""
+    if data_type == 'bool':
+        return [1 if value else 0]
+    elif data_type == 'uint16':
+        return [int(value) & 0xFFFF]
+    elif data_type == 'int16':
+        val = int(value)
+        if val < 0:
+            val = val + 65536
+        return [val & 0xFFFF]
+    elif data_type in ['uint32', 'int32', 'float32']:
+        if data_type == 'uint32':
+            bytes_val = struct.pack('>I', int(value))
+        elif data_type == 'int32':
+            bytes_val = struct.pack('>i', int(value))
+        else:  # float32
+            bytes_val = struct.pack('>f', float(value))
+        
+        regs = struct.unpack('>HH', bytes_val)
+        
+        if endian == 'ABCD':
+            return list(regs)
+        elif endian == 'CDAB':
+            return [regs[1], regs[0]]
+        elif endian == 'BADC':
+            return list(struct.unpack('<HH', bytes_val))
+        elif endian == 'DCBA':
+            r = struct.unpack('<HH', bytes_val)
+            return [r[1], r[0]]
+        return list(regs)
+    
+    return [int(value) & 0xFFFF]
+
+
+def get_register_count(data_type: str) -> int:
+    """Get number of registers needed for a data type"""
+    if data_type in ['bool', 'int16', 'uint16']:
+        return 1
+    elif data_type in ['int32', 'uint32', 'float32']:
+        return 2
+    elif data_type == 'float64':
+        return 4
+    return 1
+
+
 class PollingEngine:
+    """Enhanced polling engine that supports both real Modbus and simulation"""
+    
     def __init__(self, project_id: str):
         self.project_id = project_id
         self.is_running = False
         self.task = None
+        self.device_pollers: Dict[str, RealModbusPoller] = {}
+        self.use_simulation = False  # Will be set based on device connectivity
     
     async def start(self):
         self.is_running = True
         self.task = asyncio.create_task(self.poll_loop())
+        logger.info(f"Polling started for project {self.project_id}")
     
     async def stop(self):
         self.is_running = False
         if self.task:
             self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        
+        # Disconnect all device pollers
+        for poller in self.device_pollers.values():
+            await poller.disconnect()
+        self.device_pollers.clear()
+        logger.info(f"Polling stopped for project {self.project_id}")
+    
+    def get_or_create_poller(self, device: dict) -> RealModbusPoller:
+        """Get existing poller or create new one for device"""
+        device_id = device['id']
+        if device_id not in self.device_pollers:
+            self.device_pollers[device_id] = RealModbusPoller(device)
+        return self.device_pollers[device_id]
     
     async def poll_loop(self):
+        """Main polling loop"""
         while self.is_running:
             try:
-                devices = await db.devices.find({"project_id": self.project_id, "is_enabled": True}, {"_id": 0}).to_list(100)
+                devices = await db.devices.find(
+                    {"project_id": self.project_id, "is_enabled": True}, 
+                    {"_id": 0}
+                ).to_list(100)
                 
                 for device in devices:
                     if not self.is_running:
                         break
                     
+                    # Get tags for this device
                     tags = await db.tags.find({
                         "device_id": device['id'],
-                        "permission": {"$in": [TagPermission.READ.value, TagPermission.READ_WRITE.value]}
-                    }, {"_id": 0}).to_list(1000)
+                        "is_forced": {"$ne": True}  # Skip forced tags
+                    }, {"_id": 0}).to_list(5000)
                     
-                    for tag in tags:
-                        await self.poll_tag(device, tag)
+                    if not tags:
+                        continue
+                    
+                    # Try real Modbus first
+                    if device.get('ip_address'):
+                        await self.poll_device_real(device, tags)
+                    else:
+                        # Fall back to simulation
+                        await self.poll_device_simulated(device, tags)
                 
-                await asyncio.sleep(1)  # Default poll interval
+                # Small delay between poll cycles
+                await asyncio.sleep(0.5)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Polling error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
     
-    async def poll_tag(self, device: dict, tag: dict):
-        """Simulate polling a tag - in real implementation, this would use pymodbus"""
+    async def poll_device_real(self, device: dict, tags: List[dict]):
+        """Poll tags from a real Modbus device"""
+        poller = self.get_or_create_poller(device)
+        unit_id = device.get('unit_id', 1)
+        device_endian = device.get('default_endian', 'ABCD')
+        
+        # Group tags by object type for efficient block reads
+        tags_by_type: Dict[str, List[dict]] = {}
+        for tag in tags:
+            obj_type = tag.get('object_type', 'holding_register')
+            if obj_type not in tags_by_type:
+                tags_by_type[obj_type] = []
+            tags_by_type[obj_type].append(tag)
+        
+        # Poll each object type
+        for obj_type, type_tags in tags_by_type.items():
+            if not type_tags:
+                continue
+            
+            # Sort by address and find optimal read blocks
+            type_tags.sort(key=lambda t: t.get('address', 0))
+            
+            # Create read blocks (max block size from device config)
+            max_block = device.get('max_block_size', 120)
+            blocks = self.create_read_blocks(type_tags, max_block)
+            
+            for block_start, block_count, block_tags in blocks:
+                start_time = datetime.now(timezone.utc)
+                
+                # Read from device
+                values, error = await poller.read_registers(obj_type, block_start, block_count, unit_id)
+                
+                end_time = datetime.now(timezone.utc)
+                rtt = (end_time - start_time).total_seconds() * 1000
+                
+                if error:
+                    # Log error and update tags as bad quality
+                    await self.log_traffic(
+                        device, obj_type, block_start, block_count,
+                        None, rtt, TrafficStatus.ERROR, error
+                    )
+                    
+                    for tag in block_tags:
+                        await self.update_tag_error(tag, error)
+                    
+                    await self.update_device_status(device, "error", error)
+                    
+                    # Fall back to simulation for this device
+                    await self.poll_device_simulated(device, tags)
+                    return
+                else:
+                    # Decode and update each tag
+                    for tag in block_tags:
+                        tag_address = tag.get('address', 0)
+                        offset_in_block = tag_address - block_start
+                        reg_count = get_register_count(tag.get('data_type', 'uint16'))
+                        
+                        if offset_in_block >= 0 and offset_in_block + reg_count <= len(values):
+                            raw_vals = values[offset_in_block:offset_in_block + reg_count]
+                            endian = tag.get('endian') or device_endian
+                            
+                            # Decode value
+                            decoded = decode_modbus_value(raw_vals, tag.get('data_type', 'uint16'), endian)
+                            
+                            # Apply scale and offset
+                            if decoded is not None and tag.get('data_type') not in ['bool']:
+                                scale = tag.get('scale', 1.0) or 1.0
+                                offset = tag.get('offset', 0.0) or 0.0
+                                decoded = decoded * scale + offset
+                            
+                            await self.update_tag_value(tag, decoded, TagQuality.GOOD.value)
+                    
+                    # Log successful traffic
+                    await self.log_traffic(
+                        device, obj_type, block_start, block_count,
+                        f"Read {len(block_tags)} tags", rtt, TrafficStatus.OK, None
+                    )
+                    
+                    await self.update_device_status(device, "online", None)
+    
+    async def poll_device_simulated(self, device: dict, tags: List[dict]):
+        """Poll using local simulator or generate simulated values"""
         import random
+        import math
         
         start_time = datetime.now(timezone.utc)
         
-        try:
-            # Simulate read from simulator if available
-            sim_session = None
+        # Check for active simulator sessions or modbus servers
+        sim_source = None
+        
+        # First check modbus_servers (run as slave)
+        for sid, srv in modbus_servers.items():
+            if srv.is_running:
+                sim_source = ('server', srv)
+                break
+        
+        # Then check simulator_sessions (local simulator)
+        if not sim_source:
             for sid, sim in simulator_sessions.items():
                 if sim.is_running:
-                    sim_session = sim
+                    sim_source = ('simulator', sim)
                     break
+        
+        for tag in tags:
+            obj_type = tag.get('object_type', 'holding_register')
+            address = tag.get('address', 0)
+            data_type = tag.get('data_type', 'uint16')
             
-            if sim_session:
-                obj_type = tag.get('object_type')
-                address = tag.get('address', 0)
-                
-                if obj_type == ObjectType.COIL.value:
-                    values = sim_session.read_coils(address, 1)
-                    value = values[0] if values else False
-                elif obj_type == ObjectType.DISCRETE_INPUT.value:
-                    values = sim_session.read_discrete_inputs(address, 1)
-                    value = values[0] if values else False
-                elif obj_type == ObjectType.INPUT_REGISTER.value:
-                    values = sim_session.read_input_registers(address, 1)
-                    value = values[0] if values else 0
-                else:  # HOLDING_REGISTER
-                    values = sim_session.read_holding_registers(address, 1)
-                    value = values[0] if values else 0
-                
-                # Apply scaling
-                if tag.get('data_type') in ['float32', 'float64', 'int16', 'int32', 'uint16', 'uint32']:
-                    value = value * tag.get('scale', 1.0) + tag.get('offset', 0.0)
-            else:
-                # Generate simulated value
-                if tag.get('data_type') == 'bool':
+            value = None
+            
+            if sim_source:
+                source_type, source = sim_source
+                try:
+                    if source_type == 'server':
+                        # Read from modbus server datastore
+                        if obj_type == ObjectType.COIL.value:
+                            vals = source.read_registers("coil", address, 1)
+                            value = bool(vals[0]) if vals else False
+                        elif obj_type == ObjectType.DISCRETE_INPUT.value:
+                            vals = source.read_registers("discrete_input", address, 1)
+                            value = bool(vals[0]) if vals else False
+                        elif obj_type == ObjectType.INPUT_REGISTER.value:
+                            vals = source.read_registers("input_register", address, get_register_count(data_type))
+                            value = decode_modbus_value(vals, data_type, tag.get('endian', 'ABCD'))
+                        else:
+                            vals = source.read_registers("holding_register", address, get_register_count(data_type))
+                            value = decode_modbus_value(vals, data_type, tag.get('endian', 'ABCD'))
+                    else:
+                        # Read from simulator
+                        if obj_type == ObjectType.COIL.value:
+                            vals = source.read_coils(address, 1)
+                            value = vals[0] if vals else False
+                        elif obj_type == ObjectType.DISCRETE_INPUT.value:
+                            vals = source.read_discrete_inputs(address, 1)
+                            value = vals[0] if vals else False
+                        elif obj_type == ObjectType.INPUT_REGISTER.value:
+                            vals = source.read_input_registers(address, get_register_count(data_type))
+                            value = decode_modbus_value(vals, data_type, tag.get('endian', 'ABCD')) if vals else 0
+                        else:
+                            vals = source.read_holding_registers(address, get_register_count(data_type))
+                            value = decode_modbus_value(vals, data_type, tag.get('endian', 'ABCD')) if vals else 0
+                except Exception as e:
+                    logger.warning(f"Simulator read error: {e}")
+                    value = None
+            
+            # Generate simulated value if no source available
+            if value is None:
+                if data_type == 'bool':
                     value = random.choice([True, False])
                 else:
-                    min_val = tag.get('min_value', 0) or 0
-                    max_val = tag.get('max_value', 100) or 100
-                    value = round(random.uniform(min_val, max_val), 2)
+                    # Use sine wave for realistic simulation
+                    elapsed = (datetime.now(timezone.utc) - datetime(2024, 1, 1, tzinfo=timezone.utc)).total_seconds()
+                    min_val = tag.get('min_value') or 0
+                    max_val = tag.get('max_value') or 100
+                    amplitude = (max_val - min_val) / 2
+                    offset = min_val + amplitude
+                    # Add address-based phase offset for variety
+                    phase = address * 0.1
+                    value = offset + amplitude * math.sin(elapsed * 0.1 + phase)
+                    value = round(value, 2)
             
-            end_time = datetime.now(timezone.utc)
-            rtt = (end_time - start_time).total_seconds() * 1000
+            # Apply scale and offset for non-bool types
+            if value is not None and data_type not in ['bool']:
+                scale = tag.get('scale', 1.0) or 1.0
+                offset = tag.get('offset', 0.0) or 0.0
+                value = value * scale + offset
             
-            # Update tag value
-            await db.tags.update_one(
-                {"id": tag['id']},
-                {"$set": {
-                    "current_value": value,
-                    "quality": TagQuality.GOOD.value,
-                    "last_update": end_time.isoformat(),
-                    "error_message": None
-                }}
+            await self.update_tag_value(tag, value, TagQuality.GOOD.value)
+        
+        end_time = datetime.now(timezone.utc)
+        rtt = (end_time - start_time).total_seconds() * 1000
+        
+        # Log simulated traffic
+        await self.log_traffic(
+            device, "simulation", 0, len(tags),
+            f"Simulated {len(tags)} tags", rtt, TrafficStatus.OK, None
+        )
+        
+        await self.update_device_status(device, "simulated", None)
+    
+    def create_read_blocks(self, tags: List[dict], max_block_size: int) -> List[tuple]:
+        """Create optimal read blocks from sorted tags"""
+        if not tags:
+            return []
+        
+        blocks = []
+        current_start = tags[0].get('address', 0)
+        current_tags = [tags[0]]
+        
+        for tag in tags[1:]:
+            tag_addr = tag.get('address', 0)
+            reg_count = get_register_count(tag.get('data_type', 'uint16'))
+            current_end = current_start + sum(
+                get_register_count(t.get('data_type', 'uint16')) 
+                for t in current_tags
             )
             
-            # Log traffic
-            traffic = TrafficLog(
-                project_id=self.project_id,
-                device_id=device['id'],
-                device_name=device['name'],
-                protocol=device['protocol'],
-                function_code=3 if tag.get('object_type') in ['input_register', 'holding_register'] else 1,
-                request_summary=f"Read {tag['name']} @ {tag.get('address')}",
-                response_summary=f"Value: {value}",
-                round_trip_ms=rtt,
-                status=TrafficStatus.OK
-            )
-            doc = traffic.model_dump()
-            doc['timestamp'] = doc['timestamp'].isoformat()
-            await db.traffic_logs.insert_one(doc)
+            # Check if we can extend the current block
+            gap = tag_addr - current_end
+            potential_block_size = tag_addr - current_start + reg_count
             
-            # Update device status
-            await db.devices.update_one(
-                {"id": device['id']},
-                {"$set": {"status": "online", "last_poll": end_time.isoformat()},
-                 "$inc": {"success_count": 1}}
-            )
-            
-        except Exception as e:
-            # Log error
-            traffic = TrafficLog(
-                project_id=self.project_id,
-                device_id=device['id'],
-                device_name=device['name'],
-                protocol=device['protocol'],
-                function_code=3,
-                request_summary=f"Read {tag['name']} @ {tag.get('address')}",
-                status=TrafficStatus.ERROR,
-                error_details=str(e)
-            )
-            doc = traffic.model_dump()
-            doc['timestamp'] = doc['timestamp'].isoformat()
-            await db.traffic_logs.insert_one(doc)
-            
-            # Update tag quality
-            await db.tags.update_one(
-                {"id": tag['id']},
-                {"$set": {
-                    "quality": TagQuality.BAD.value,
-                    "error_message": str(e)
-                }}
-            )
-            
-            # Update device status
-            await db.devices.update_one(
-                {"id": device['id']},
-                {"$set": {"status": "error"},
-                 "$inc": {"error_count": 1}}
-            )
+            if gap <= 10 and potential_block_size <= max_block_size:
+                # Extend current block
+                current_tags.append(tag)
+            else:
+                # Save current block and start new one
+                block_count = max(
+                    t.get('address', 0) + get_register_count(t.get('data_type', 'uint16')) 
+                    for t in current_tags
+                ) - current_start
+                blocks.append((current_start, block_count, current_tags))
+                
+                current_start = tag_addr
+                current_tags = [tag]
+        
+        # Don't forget the last block
+        if current_tags:
+            block_count = max(
+                t.get('address', 0) + get_register_count(t.get('data_type', 'uint16')) 
+                for t in current_tags
+            ) - current_start
+            blocks.append((current_start, block_count, current_tags))
+        
+        return blocks
+    
+    async def update_tag_value(self, tag: dict, value: Any, quality: str):
+        """Update tag value in database and broadcast via WebSocket"""
+        now = datetime.now(timezone.utc)
+        
+        await db.tags.update_one(
+            {"id": tag['id']},
+            {"$set": {
+                "current_value": value,
+                "quality": quality,
+                "last_update": now.isoformat(),
+                "error_message": None
+            }}
+        )
+        
+        # Broadcast update via WebSocket
+        await broadcast_tag_update(self.project_id, tag['id'], value, quality)
+    
+    async def update_tag_error(self, tag: dict, error: str):
+        """Update tag with error status"""
+        await db.tags.update_one(
+            {"id": tag['id']},
+            {"$set": {
+                "quality": TagQuality.BAD.value,
+                "error_message": error
+            }}
+        )
+        
+        await broadcast_tag_update(self.project_id, tag['id'], tag.get('current_value'), TagQuality.BAD.value)
+    
+    async def update_device_status(self, device: dict, status: str, error: Optional[str]):
+        """Update device status in database"""
+        update = {"status": status, "last_poll": datetime.now(timezone.utc).isoformat()}
+        if error:
+            update["$inc"] = {"error_count": 1}
+        else:
+            update["$inc"] = {"success_count": 1}
+        
+        # Separate $set and $inc
+        set_update = {"status": status, "last_poll": datetime.now(timezone.utc).isoformat()}
+        inc_update = {"error_count": 1} if error else {"success_count": 1}
+        
+        await db.devices.update_one(
+            {"id": device['id']},
+            {"$set": set_update, "$inc": inc_update}
+        )
+    
+    async def log_traffic(self, device: dict, obj_type: str, start_addr: int, count: int,
+                          response: Optional[str], rtt: float, status: TrafficStatus, error: Optional[str]):
+        """Log traffic to database"""
+        fc_map = {
+            'coil': 1, 'discrete_input': 2, 
+            'input_register': 4, 'holding_register': 3,
+            'simulation': 0
+        }
+        
+        traffic = TrafficLog(
+            project_id=self.project_id,
+            device_id=device['id'],
+            device_name=device['name'],
+            protocol=device.get('protocol', 'tcp'),
+            function_code=fc_map.get(obj_type, 3),
+            request_summary=f"Read {obj_type} @ {start_addr} x{count}",
+            response_summary=response,
+            round_trip_ms=rtt,
+            status=status,
+            error_details=error
+        )
+        doc = traffic.model_dump()
+        doc['timestamp'] = doc['timestamp'].isoformat()
+        await db.traffic_logs.insert_one(doc)
 
 @api_router.post("/projects/{project_id}/polling/start")
 async def start_polling(project_id: str, user: User = Depends(require_role([UserRole.ADMIN, UserRole.ENGINEER, UserRole.OPERATOR]))):
@@ -2694,6 +3158,84 @@ class TagForceRequest(BaseModel):
     force: bool = False  # If True, bypasses read-only check
 
 # ==================== WRITE ENGINE ====================
+async def write_to_real_device(device: dict, tag: dict, raw_value: Any) -> tuple:
+    """Write to real Modbus device. Returns (success, error)"""
+    try:
+        protocol = device.get('protocol', 'tcp')
+        ip = device.get('ip_address')
+        port = device.get('port', 502)
+        unit_id = device.get('unit_id', 1)
+        
+        if not ip:
+            return False, "No IP address configured"
+        
+        # Create temporary client for write
+        if protocol == 'tcp':
+            client = AsyncModbusTcpClient(host=ip, port=port, timeout=device.get('timeout_ms', 3000) / 1000.0)
+        elif protocol == 'udp':
+            client = AsyncModbusUdpClient(host=ip, port=port, timeout=device.get('timeout_ms', 3000) / 1000.0)
+        else:
+            return False, f"Unsupported protocol: {protocol}"
+        
+        connected = await client.connect()
+        if not connected:
+            return False, f"Failed to connect to {ip}:{port}"
+        
+        try:
+            obj_type = tag.get('object_type')
+            address = tag.get('address', 0)
+            data_type = tag.get('data_type', 'uint16')
+            endian = tag.get('endian') or device.get('default_endian', 'ABCD')
+            
+            if obj_type == ObjectType.COIL.value:
+                result = await client.write_coil(address, bool(raw_value), slave=unit_id)
+            elif obj_type == ObjectType.HOLDING_REGISTER.value:
+                # Encode value to registers
+                registers = encode_modbus_value(raw_value, data_type, endian)
+                if len(registers) == 1:
+                    result = await client.write_register(address, registers[0], slave=unit_id)
+                else:
+                    result = await client.write_registers(address, registers, slave=unit_id)
+            else:
+                return False, f"Cannot write to {obj_type}"
+            
+            if result.isError():
+                return False, f"Modbus write error: {result}"
+            
+            return True, None
+        finally:
+            client.close()
+            
+    except Exception as e:
+        return False, str(e)
+
+
+async def write_to_simulator(tag: dict, raw_value: Any) -> bool:
+    """Write to local simulator or modbus server"""
+    obj_type = tag.get('object_type')
+    address = tag.get('address', 0)
+    
+    # Try modbus_servers first
+    for sid, srv in modbus_servers.items():
+        if srv.is_running:
+            if obj_type == ObjectType.COIL.value:
+                srv.write_registers("coil", address, [bool(raw_value)])
+            elif obj_type == ObjectType.HOLDING_REGISTER.value:
+                srv.write_registers("holding_register", address, [int(raw_value) & 0xFFFF])
+            return True
+    
+    # Then try simulator_sessions
+    for sid, sim in simulator_sessions.items():
+        if sim.is_running:
+            if obj_type == ObjectType.COIL.value:
+                sim.write_coil(address, bool(raw_value))
+            elif obj_type == ObjectType.HOLDING_REGISTER.value:
+                sim.write_register(address, int(raw_value))
+            return True
+    
+    return False
+
+
 @api_router.post("/tags/{tag_id}/write")
 async def write_tag(
     tag_id: str,
@@ -2714,28 +3256,65 @@ async def write_tag(
     if tag.get('max_value') is not None and value > tag['max_value']:
         raise HTTPException(status_code=400, detail=f"Value above maximum ({tag['max_value']})")
     
-    # Write to simulator if available
-    for sid, sim in simulator_sessions.items():
-        if sim.is_running:
-            obj_type = tag.get('object_type')
-            address = tag.get('address', 0)
-            
-            if obj_type == ObjectType.COIL.value:
-                sim.write_coil(address, bool(value))
-            elif obj_type == ObjectType.HOLDING_REGISTER.value:
-                # Reverse scaling
-                raw_value = (value - tag.get('offset', 0)) / tag.get('scale', 1)
-                sim.write_register(address, int(raw_value))
-            break
+    # Get device
+    device = await db.devices.find_one({"id": tag['device_id']}, {"_id": 0})
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    # Calculate raw value (reverse scale/offset)
+    scale = tag.get('scale', 1.0) or 1.0
+    offset = tag.get('offset', 0.0) or 0.0
+    raw_value = (value - offset) / scale if scale != 0 else value
+    
+    start_time = datetime.now(timezone.utc)
+    write_error = None
+    write_success = False
+    
+    # Try real device first if IP is configured
+    if device.get('ip_address'):
+        write_success, write_error = await write_to_real_device(device, tag, raw_value)
+    
+    # Fall back to simulator
+    if not write_success:
+        sim_success = await write_to_simulator(tag, raw_value)
+        if sim_success:
+            write_success = True
+            write_error = None
+    
+    end_time = datetime.now(timezone.utc)
+    rtt = (end_time - start_time).total_seconds() * 1000
+    
+    if not write_success and write_error:
+        # Log failed traffic
+        traffic = TrafficLog(
+            project_id=tag['project_id'],
+            device_id=device['id'],
+            device_name=device['name'],
+            protocol=device.get('protocol', 'tcp'),
+            function_code=6 if tag.get('object_type') == ObjectType.HOLDING_REGISTER.value else 5,
+            request_summary=f"Write {tag['name']} = {value}",
+            response_summary=None,
+            round_trip_ms=rtt,
+            status=TrafficStatus.ERROR,
+            error_details=write_error
+        )
+        doc = traffic.model_dump()
+        doc['timestamp'] = doc['timestamp'].isoformat()
+        await db.traffic_logs.insert_one(doc)
+        
+        raise HTTPException(status_code=500, detail=f"Write failed: {write_error}")
     
     # Update tag value
     await db.tags.update_one(
         {"id": tag_id},
         {"$set": {
             "current_value": value,
-            "last_update": datetime.now(timezone.utc).isoformat()
+            "last_update": end_time.isoformat()
         }}
     )
+    
+    # Broadcast update
+    await broadcast_tag_update(tag['project_id'], tag_id, value, TagQuality.GOOD.value)
     
     # Log audit
     await log_audit(user, "tag_write", {
@@ -2744,23 +3323,21 @@ async def write_tag(
         "value": value
     })
     
-    # Log traffic
-    device = await db.devices.find_one({"id": tag['device_id']}, {"_id": 0})
-    if device:
-        traffic = TrafficLog(
-            project_id=tag['project_id'],
-            device_id=device['id'],
-            device_name=device['name'],
-            protocol=device['protocol'],
-            function_code=6 if tag.get('object_type') == ObjectType.HOLDING_REGISTER.value else 5,
-            request_summary=f"Write {tag['name']} = {value}",
-            response_summary="OK",
-            round_trip_ms=1.0,
-            status=TrafficStatus.OK
-        )
-        doc = traffic.model_dump()
-        doc['timestamp'] = doc['timestamp'].isoformat()
-        await db.traffic_logs.insert_one(doc)
+    # Log successful traffic
+    traffic = TrafficLog(
+        project_id=tag['project_id'],
+        device_id=device['id'],
+        device_name=device['name'],
+        protocol=device.get('protocol', 'tcp'),
+        function_code=6 if tag.get('object_type') == ObjectType.HOLDING_REGISTER.value else 5,
+        request_summary=f"Write {tag['name']} = {value}",
+        response_summary="OK",
+        round_trip_ms=rtt,
+        status=TrafficStatus.OK
+    )
+    doc = traffic.model_dump()
+    doc['timestamp'] = doc['timestamp'].isoformat()
+    await db.traffic_logs.insert_one(doc)
     
     return {"message": "Write successful", "value": value}
 

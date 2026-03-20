@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
@@ -11,12 +11,32 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 import { ScrollArea } from '../components/ui/scroll-area';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '../components/ui/dialog';
-import { Tags, Search, RefreshCw, Filter, ChevronLeft, ChevronRight, Edit2, Lock, Unlock, Check, X, LineChart } from 'lucide-react';
+import { Label } from '../components/ui/label';
+import { Tags, Search, RefreshCw, Filter, ChevronLeft, ChevronRight, Edit2, Lock, Unlock, Check, X, LineChart, Plus, Trash2, Settings2 } from 'lucide-react';
 import { cn, getQualityColor, formatDate } from '../lib/utils';
 import { toast } from 'sonner';
 
 const API_URL = process.env.REACT_APP_BACKEND_URL;
 const PAGE_SIZE = 50;
+
+// Default new tag template
+const DEFAULT_TAG = {
+  name: '',
+  device_id: '',
+  object_type: 'holding_register',
+  address: 0,
+  bit: null,
+  data_type: 'uint16',
+  permission: 'R',
+  scale: 1.0,
+  offset: 0.0,
+  unit: '',
+  poll_ms: 1000,
+  min_value: null,
+  max_value: null,
+  endian: 'ABCD',
+  description: ''
+};
 
 export const TagBrowserPage = () => {
   const { token, canConfigure, canWrite } = useAuth();
@@ -35,8 +55,63 @@ export const TagBrowserPage = () => {
   // Force dialog state
   const [forceDialog, setForceDialog] = useState(null);
   const [forceValue, setForceValue] = useState('');
+  
+  // Tag create/edit dialog state
+  const [tagDialog, setTagDialog] = useState(null); // null = closed, 'create' = new, tag object = edit
+  const [tagForm, setTagForm] = useState(DEFAULT_TAG);
+  const [tagSaving, setTagSaving] = useState(false);
+  
+  // Auto-refresh with WebSocket
+  const wsRef = useRef(null);
+  const refreshIntervalRef = useRef(null);
 
   const headers = { Authorization: `Bearer ${token}` };
+
+  // WebSocket for real-time tag updates
+  useEffect(() => {
+    if (!currentProject?.id || !token) return;
+    
+    // Set up polling refresh (WebSocket may not work through ingress)
+    refreshIntervalRef.current = setInterval(() => {
+      refreshTags();
+    }, 3000);
+    
+    // Try WebSocket connection
+    const wsUrl = API_URL.replace('https://', 'wss://').replace('http://', 'ws://');
+    try {
+      const ws = new WebSocket(`${wsUrl}/ws/tags/${currentProject.id}`);
+      
+      ws.onopen = () => {
+        console.log('Tag WebSocket connected');
+      };
+      
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'tag_update') {
+            setTags(prev => prev.map(t => 
+              t.id === msg.tag_id 
+                ? { ...t, current_value: msg.value, quality: msg.quality, last_update: msg.timestamp }
+                : t
+            ));
+          }
+        } catch (e) {}
+      };
+      
+      ws.onerror = () => {
+        console.log('WebSocket error, using HTTP polling');
+      };
+      
+      wsRef.current = ws;
+    } catch (e) {
+      console.log('WebSocket not available');
+    }
+    
+    return () => {
+      if (refreshIntervalRef.current) clearInterval(refreshIntervalRef.current);
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [currentProject?.id, token]);
 
   // Navigate to Historian with selected tag
   const handleViewInHistorian = (tag) => {
@@ -185,6 +260,92 @@ export const TagBrowserPage = () => {
     }
   };
 
+  // Tag create/edit functions
+  const handleOpenCreateTag = () => {
+    setTagForm({ ...DEFAULT_TAG, device_id: devices[0]?.id || '' });
+    setTagDialog('create');
+  };
+
+  const handleOpenEditTag = (tag) => {
+    setTagForm({
+      name: tag.name || '',
+      device_id: tag.device_id || '',
+      object_type: tag.object_type || 'holding_register',
+      address: tag.address || 0,
+      bit: tag.bit || null,
+      data_type: tag.data_type || 'uint16',
+      permission: tag.permission || 'R',
+      scale: tag.scale || 1.0,
+      offset: tag.offset || 0.0,
+      unit: tag.unit || '',
+      poll_ms: tag.poll_ms || 1000,
+      min_value: tag.min_value,
+      max_value: tag.max_value,
+      endian: tag.endian || 'ABCD',
+      description: tag.description || ''
+    });
+    setTagDialog(tag);
+  };
+
+  const handleSaveTag = async () => {
+    if (!tagForm.name || !tagForm.device_id) {
+      toast.error('Tag name and device are required');
+      return;
+    }
+    
+    setTagSaving(true);
+    try {
+      const payload = {
+        ...tagForm,
+        address: parseInt(tagForm.address) || 0,
+        bit: tagForm.bit ? parseInt(tagForm.bit) : null,
+        scale: parseFloat(tagForm.scale) || 1.0,
+        offset: parseFloat(tagForm.offset) || 0.0,
+        poll_ms: parseInt(tagForm.poll_ms) || 1000,
+        min_value: tagForm.min_value !== '' && tagForm.min_value !== null ? parseFloat(tagForm.min_value) : null,
+        max_value: tagForm.max_value !== '' && tagForm.max_value !== null ? parseFloat(tagForm.max_value) : null,
+      };
+      
+      if (tagDialog === 'create') {
+        // Create new tag
+        const response = await axios.post(
+          `${API_URL}/api/projects/${currentProject.id}/tags`,
+          payload,
+          { headers }
+        );
+        setTags(prev => [...prev, response.data]);
+        toast.success(`Tag "${tagForm.name}" created`);
+      } else {
+        // Update existing tag
+        const response = await axios.put(
+          `${API_URL}/api/tags/${tagDialog.id}`,
+          payload,
+          { headers }
+        );
+        setTags(prev => prev.map(t => t.id === tagDialog.id ? response.data : t));
+        toast.success(`Tag "${tagForm.name}" updated`);
+      }
+      
+      setTagDialog(null);
+      setTagForm(DEFAULT_TAG);
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to save tag');
+    }
+    setTagSaving(false);
+  };
+
+  const handleDeleteTag = async (tag) => {
+    if (!window.confirm(`Delete tag "${tag.name}"?`)) return;
+    
+    try {
+      await axios.delete(`${API_URL}/api/tags/${tag.id}`, { headers });
+      setTags(prev => prev.filter(t => t.id !== tag.id));
+      toast.success(`Tag "${tag.name}" deleted`);
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to delete tag');
+    }
+  };
+
   if (!currentProject) {
     return (
       <div className="flex flex-col items-center justify-center py-20" data-testid="tags-page-no-project">
@@ -202,10 +363,18 @@ export const TagBrowserPage = () => {
           <h1 className="text-2xl font-bold tracking-tight">Tag Browser</h1>
           <p className="text-muted-foreground">{filteredTags.length} tags in {currentProject.name}</p>
         </div>
-        <Button variant="outline" onClick={refreshTags} data-testid="refresh-tags-btn">
-          <RefreshCw className="w-4 h-4 mr-2" />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          {canConfigure() && (
+            <Button onClick={handleOpenCreateTag} data-testid="create-tag-btn">
+              <Plus className="w-4 h-4 mr-2" />
+              New Tag
+            </Button>
+          )}
+          <Button variant="outline" onClick={refreshTags} data-testid="refresh-tags-btn">
+            <RefreshCw className="w-4 h-4 mr-2" />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {/* Filters */}
@@ -389,6 +558,26 @@ export const TagBrowserPage = () => {
                                 <Lock className="w-4 h-4" />
                               </Button>
                             )}
+                            <Button 
+                              size="icon" 
+                              variant="ghost" 
+                              className="h-7 w-7"
+                              onClick={() => handleOpenEditTag(tag)}
+                              title="Edit tag"
+                              data-testid={`config-btn-${tag.id}`}
+                            >
+                              <Settings2 className="w-4 h-4" />
+                            </Button>
+                            <Button 
+                              size="icon" 
+                              variant="ghost" 
+                              className="h-7 w-7 text-destructive hover:text-destructive"
+                              onClick={() => handleDeleteTag(tag)}
+                              title="Delete tag"
+                              data-testid={`delete-btn-${tag.id}`}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </Button>
                           </>
                         )}
                       </div>
@@ -469,6 +658,229 @@ export const TagBrowserPage = () => {
             <Button onClick={handleForceValue} data-testid="confirm-force-btn">
               <Lock className="w-4 h-4 mr-2" />
               Force Value
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Tag Create/Edit Dialog */}
+      <Dialog open={!!tagDialog} onOpenChange={() => { setTagDialog(null); setTagForm(DEFAULT_TAG); }}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{tagDialog === 'create' ? 'Create New Tag' : `Edit Tag - ${tagDialog?.name}`}</DialogTitle>
+            <DialogDescription>Configure tag mapping for Modbus communication</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4">
+            {/* Row 1: Name and Device */}
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="tag-name">Tag Name *</Label>
+                <Input
+                  id="tag-name"
+                  value={tagForm.name}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, name: e.target.value }))}
+                  placeholder="e.g., Tank_Level_001"
+                  data-testid="tag-name-input"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-device">Device *</Label>
+                <Select value={tagForm.device_id} onValueChange={(v) => setTagForm(prev => ({ ...prev, device_id: v }))}>
+                  <SelectTrigger id="tag-device" data-testid="tag-device-select">
+                    <SelectValue placeholder="Select device" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {devices.map(d => (
+                      <SelectItem key={d.id} value={d.id}>{d.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            {/* Row 2: Object Type and Address */}
+            <div className="grid grid-cols-3 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="tag-objtype">Object Type</Label>
+                <Select value={tagForm.object_type} onValueChange={(v) => setTagForm(prev => ({ ...prev, object_type: v }))}>
+                  <SelectTrigger id="tag-objtype" data-testid="tag-objtype-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="coil">Coil (0x)</SelectItem>
+                    <SelectItem value="discrete_input">Discrete Input (1x)</SelectItem>
+                    <SelectItem value="input_register">Input Register (3x)</SelectItem>
+                    <SelectItem value="holding_register">Holding Register (4x)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-address">Address</Label>
+                <Input
+                  id="tag-address"
+                  type="number"
+                  min="0"
+                  max="65535"
+                  value={tagForm.address}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, address: e.target.value }))}
+                  data-testid="tag-address-input"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-bit">Bit (optional)</Label>
+                <Input
+                  id="tag-bit"
+                  type="number"
+                  min="0"
+                  max="15"
+                  value={tagForm.bit || ''}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, bit: e.target.value || null }))}
+                  placeholder="0-15"
+                  data-testid="tag-bit-input"
+                />
+              </div>
+            </div>
+
+            {/* Row 3: Data Type, Permission, Endian */}
+            <div className="grid grid-cols-3 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="tag-dtype">Data Type</Label>
+                <Select value={tagForm.data_type} onValueChange={(v) => setTagForm(prev => ({ ...prev, data_type: v }))}>
+                  <SelectTrigger id="tag-dtype" data-testid="tag-dtype-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="bool">BOOL</SelectItem>
+                    <SelectItem value="int16">INT16</SelectItem>
+                    <SelectItem value="uint16">UINT16</SelectItem>
+                    <SelectItem value="int32">INT32</SelectItem>
+                    <SelectItem value="uint32">UINT32</SelectItem>
+                    <SelectItem value="float32">FLOAT32</SelectItem>
+                    <SelectItem value="float64">FLOAT64</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-perm">Permission</Label>
+                <Select value={tagForm.permission} onValueChange={(v) => setTagForm(prev => ({ ...prev, permission: v }))}>
+                  <SelectTrigger id="tag-perm" data-testid="tag-perm-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="R">Read Only</SelectItem>
+                    <SelectItem value="W">Write Only</SelectItem>
+                    <SelectItem value="RW">Read/Write</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-endian">Endianness</Label>
+                <Select value={tagForm.endian} onValueChange={(v) => setTagForm(prev => ({ ...prev, endian: v }))}>
+                  <SelectTrigger id="tag-endian" data-testid="tag-endian-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ABCD">ABCD (Big-endian)</SelectItem>
+                    <SelectItem value="CDAB">CDAB (Word swap)</SelectItem>
+                    <SelectItem value="BADC">BADC (Byte swap)</SelectItem>
+                    <SelectItem value="DCBA">DCBA (Little-endian)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            {/* Row 4: Scale, Offset, Unit */}
+            <div className="grid grid-cols-3 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="tag-scale">Scale</Label>
+                <Input
+                  id="tag-scale"
+                  type="number"
+                  step="any"
+                  value={tagForm.scale}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, scale: e.target.value }))}
+                  data-testid="tag-scale-input"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-offset">Offset</Label>
+                <Input
+                  id="tag-offset"
+                  type="number"
+                  step="any"
+                  value={tagForm.offset}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, offset: e.target.value }))}
+                  data-testid="tag-offset-input"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-unit">Unit</Label>
+                <Input
+                  id="tag-unit"
+                  value={tagForm.unit}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, unit: e.target.value }))}
+                  placeholder="e.g., °C, bar, m³/h"
+                  data-testid="tag-unit-input"
+                />
+              </div>
+            </div>
+
+            {/* Row 5: Min, Max, Poll interval */}
+            <div className="grid grid-cols-3 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="tag-min">Min Value</Label>
+                <Input
+                  id="tag-min"
+                  type="number"
+                  step="any"
+                  value={tagForm.min_value ?? ''}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, min_value: e.target.value }))}
+                  placeholder="Optional"
+                  data-testid="tag-min-input"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-max">Max Value</Label>
+                <Input
+                  id="tag-max"
+                  type="number"
+                  step="any"
+                  value={tagForm.max_value ?? ''}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, max_value: e.target.value }))}
+                  placeholder="Optional"
+                  data-testid="tag-max-input"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="tag-poll">Poll Interval (ms)</Label>
+                <Input
+                  id="tag-poll"
+                  type="number"
+                  min="100"
+                  step="100"
+                  value={tagForm.poll_ms}
+                  onChange={(e) => setTagForm(prev => ({ ...prev, poll_ms: e.target.value }))}
+                  data-testid="tag-poll-input"
+                />
+              </div>
+            </div>
+
+            {/* Row 6: Description */}
+            <div className="space-y-2">
+              <Label htmlFor="tag-desc">Description</Label>
+              <Input
+                id="tag-desc"
+                value={tagForm.description}
+                onChange={(e) => setTagForm(prev => ({ ...prev, description: e.target.value }))}
+                placeholder="Optional description"
+                data-testid="tag-desc-input"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setTagDialog(null); setTagForm(DEFAULT_TAG); }}>Cancel</Button>
+            <Button onClick={handleSaveTag} disabled={tagSaving} data-testid="save-tag-btn">
+              {tagSaving ? 'Saving...' : (tagDialog === 'create' ? 'Create Tag' : 'Save Changes')}
             </Button>
           </DialogFooter>
         </DialogContent>
