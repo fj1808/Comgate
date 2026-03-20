@@ -4461,33 +4461,92 @@ class ModbusScanRequest(BaseModel):
     subnet: Optional[str] = None
     port: int = 5020
     timeout: float = 0.5
+    probe_modbus: bool = True  # Actually verify Modbus protocol
+    scan_ports: List[int] = [502, 503, 5020]  # Common Modbus ports
+
+class AddDiscoveredDeviceRequest(BaseModel):
+    project_id: str
+    ip: str
+    port: int
+    device_name: Optional[str] = None
+    unit_id: int = 1
 
 @api_router.post("/discovery/scan-modbus")
 async def discovery_scan_modbus(request: ModbusScanRequest, user: User = Depends(get_current_user)):
-    """Scan for Modbus TCP devices on the network"""
+    """Scan for Modbus TCP devices on the network with protocol verification"""
     import socket
     
     local_ip = get_local_ip()
     subnet_prefix = request.subnet or ".".join(local_ip.split(".")[:3])
-    scan_port = request.port
+    scan_ports = request.scan_ports if request.scan_ports else [request.port]
     scan_timeout = request.timeout
+    probe_modbus = request.probe_modbus
     
     found_devices = []
     
-    async def check_modbus_host(ip):
+    async def check_modbus_host(ip, port):
         def _check():
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(scan_timeout)
-                result = sock.connect_ex((ip, scan_port))
-                sock.close()
+                result = sock.connect_ex((ip, port))
+                
                 if result == 0:
-                    return {
+                    device_info = {
                         "ip": ip,
-                        "port": scan_port,
+                        "port": port,
                         "type": "modbus_tcp",
-                        "is_self": (ip == local_ip)
+                        "is_self": (ip == local_ip),
+                        "verified": False,
+                        "unit_ids": [],
+                        "hostname": None
                     }
+                    
+                    # Try to get hostname
+                    try:
+                        hostname = socket.gethostbyaddr(ip)[0]
+                        device_info["hostname"] = hostname
+                    except:
+                        pass
+                    
+                    # Probe Modbus if enabled
+                    if probe_modbus:
+                        try:
+                            # Send Modbus TCP request: Read Holding Register (FC 03) at address 0, quantity 1
+                            # Transaction ID (2) + Protocol ID (2) + Length (2) + Unit ID (1) + FC (1) + Start (2) + Qty (2)
+                            for unit_id in [1, 0, 255]:  # Try common unit IDs
+                                try:
+                                    modbus_req = bytes([
+                                        0x00, 0x01,  # Transaction ID
+                                        0x00, 0x00,  # Protocol ID (Modbus)
+                                        0x00, 0x06,  # Length
+                                        unit_id,     # Unit ID
+                                        0x03,        # Function Code: Read Holding Registers
+                                        0x00, 0x00,  # Start Address
+                                        0x00, 0x01   # Quantity
+                                    ])
+                                    
+                                    probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                    probe_sock.settimeout(1.0)
+                                    probe_sock.connect((ip, port))
+                                    probe_sock.send(modbus_req)
+                                    response = probe_sock.recv(256)
+                                    probe_sock.close()
+                                    
+                                    # Check if valid Modbus response (at least 9 bytes, protocol ID = 0)
+                                    if len(response) >= 9 and response[2:4] == b'\x00\x00':
+                                        device_info["verified"] = True
+                                        if unit_id not in device_info["unit_ids"]:
+                                            device_info["unit_ids"].append(unit_id)
+                                except:
+                                    pass
+                        except:
+                            pass
+                    
+                    sock.close()
+                    return device_info
+                
+                sock.close()
             except Exception:
                 pass
             return None
@@ -4496,17 +4555,91 @@ async def discovery_scan_modbus(request: ModbusScanRequest, user: User = Depends
         if result:
             found_devices.append(result)
     
-    tasks = [check_modbus_host(f"{subnet_prefix}.{i}") for i in range(1, 255)]
+    # Scan all IPs on all specified ports
+    tasks = []
+    for port in scan_ports:
+        for i in range(1, 255):
+            tasks.append(check_modbus_host(f"{subnet_prefix}.{i}", port))
+    
     await asyncio.gather(*tasks)
     
-    found_devices.sort(key=lambda x: x.get("is_self", False), reverse=True)
+    # Deduplicate by IP (keep the one with most info)
+    devices_by_ip = {}
+    for d in found_devices:
+        key = d["ip"]
+        if key not in devices_by_ip:
+            devices_by_ip[key] = d
+        else:
+            # Merge unit_ids and prefer verified
+            existing = devices_by_ip[key]
+            if d.get("verified"):
+                existing["verified"] = True
+            existing["unit_ids"] = list(set(existing.get("unit_ids", []) + d.get("unit_ids", [])))
+    
+    unique_devices = list(devices_by_ip.values())
+    unique_devices.sort(key=lambda x: (not x.get("verified", False), not x.get("is_self", False)))
+    
     return {
         "local_ip": local_ip,
         "subnet": subnet_prefix,
-        "port_scanned": scan_port,
-        "devices": found_devices,
+        "ports_scanned": scan_ports,
+        "port_scanned": scan_ports[0],  # For backward compatibility
+        "devices": unique_devices,
+        "total_found": len(unique_devices),
+        "verified_count": sum(1 for d in unique_devices if d.get("verified")),
         "scanned_at": datetime.now(timezone.utc).isoformat()
     }
+
+
+@api_router.post("/discovery/add-device")
+async def discovery_add_device(request: AddDiscoveredDeviceRequest, user: User = Depends(require_role([UserRole.ADMIN, UserRole.ENGINEER]))):
+    """Add a discovered Modbus device to a project"""
+    
+    # Check project exists
+    project = await db.projects.find_one({"id": request.project_id}, {"_id": 0})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Generate device name if not provided
+    device_name = request.device_name or f"Device_{request.ip.replace('.', '_')}_{request.port}"
+    
+    # Check if device already exists
+    existing = await db.devices.find_one({
+        "project_id": request.project_id,
+        "ip_address": request.ip,
+        "port": request.port
+    }, {"_id": 0})
+    
+    if existing:
+        return {"message": "Device already exists", "device": existing, "created": False}
+    
+    # Create device
+    device = Device(
+        name=device_name,
+        project_id=request.project_id,
+        protocol=ProtocolType.TCP,
+        ip_address=request.ip,
+        port=request.port,
+        unit_id=request.unit_id,
+        timeout_ms=3000,
+        retries=3,
+        max_block_size=120,
+        default_endian="ABCD"
+    )
+    
+    doc = device.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    await db.devices.insert_one(doc)
+    
+    # Log audit
+    await log_audit(user, "device_added_from_discovery", {
+        "device_id": device.id,
+        "device_name": device_name,
+        "ip": request.ip,
+        "port": request.port
+    })
+    
+    return {"message": "Device added successfully", "device": doc, "created": True}
 
 @api_router.post("/discovery/scan")
 async def discovery_scan(request: NetworkScanRequest, user: User = Depends(get_current_user)):

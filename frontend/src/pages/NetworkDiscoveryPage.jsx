@@ -1,12 +1,14 @@
 import React, { useState } from 'react';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
+import { useProject } from '../context/ProjectContext';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
-import { Radar, Server, Wifi, Monitor, Loader2, CheckCircle, XCircle, Copy, Plug } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
+import { Radar, Server, Wifi, Monitor, Loader2, CheckCircle, XCircle, Copy, Plug, Plus, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '../lib/utils';
 
@@ -14,12 +16,14 @@ const API_URL = process.env.REACT_APP_BACKEND_URL;
 
 export const NetworkDiscoveryPage = () => {
   const { token } = useAuth();
+  const { currentProject, refreshDevices } = useProject();
   const [scanning, setScanning] = useState(false);
   const [scanningModbus, setScanningModbus] = useState(false);
   const [scanResult, setScanResult] = useState(null);
   const [modbusResult, setModbusResult] = useState(null);
   const [customSubnet, setCustomSubnet] = useState('');
-  const [modbusPort, setModbusPort] = useState('5020');
+  const [modbusPort, setModbusPort] = useState('502,503,5020');
+  const [addingDevice, setAddingDevice] = useState(null);
   const headers = { Authorization: `Bearer ${token}` };
 
   const handleScan = async () => {
@@ -45,19 +49,53 @@ export const NetworkDiscoveryPage = () => {
     setScanningModbus(true);
     setModbusResult(null);
     try {
-      const payload = { port: parseInt(modbusPort) || 5020 };
+      // Parse comma-separated ports
+      const ports = modbusPort.split(',').map(p => parseInt(p.trim())).filter(p => !isNaN(p) && p > 0);
+      const payload = { 
+        scan_ports: ports.length > 0 ? ports : [502, 503, 5020],
+        probe_modbus: true 
+      };
       if (customSubnet.trim()) payload.subnet = customSubnet.trim();
       const response = await axios.post(`${API_URL}/api/discovery/scan-modbus`, payload, { headers });
       setModbusResult(response.data);
       if (response.data.devices.length === 0) {
         toast.info('No Modbus devices found on the network');
       } else {
-        toast.success(`Found ${response.data.devices.length} Modbus device(s)`);
+        const verified = response.data.verified_count || 0;
+        toast.success(`Found ${response.data.devices.length} device(s), ${verified} verified Modbus`);
       }
     } catch (error) {
       toast.error('Modbus scan failed: ' + (error.response?.data?.detail || error.message));
     }
     setScanningModbus(false);
+  };
+
+  const handleAddDevice = async (device) => {
+    if (!currentProject) {
+      toast.error('Please select a project first');
+      return;
+    }
+    
+    setAddingDevice(device.ip);
+    try {
+      const response = await axios.post(`${API_URL}/api/discovery/add-device`, {
+        project_id: currentProject.id,
+        ip: device.ip,
+        port: device.port,
+        unit_id: device.unit_ids?.[0] || 1,
+        device_name: device.hostname || `Modbus_${device.ip.split('.').pop()}`
+      }, { headers });
+      
+      if (response.data.created) {
+        toast.success(`Device added to ${currentProject.name}`);
+        refreshDevices();
+      } else {
+        toast.info('Device already exists in this project');
+      }
+    } catch (error) {
+      toast.error('Failed to add device: ' + (error.response?.data?.detail || error.message));
+    }
+    setAddingDevice(null);
   };
 
   const copyIp = (ip) => {
@@ -94,9 +132,9 @@ export const NetworkDiscoveryPage = () => {
               />
             </div>
             <div className="space-y-2">
-              <Label>Modbus Port</Label>
+              <Label>Modbus Ports (comma-separated)</Label>
               <Input
-                placeholder="5020"
+                placeholder="502,503,5020"
                 value={modbusPort}
                 onChange={(e) => setModbusPort(e.target.value)}
                 data-testid="modbus-port-input"
@@ -170,23 +208,31 @@ export const NetworkDiscoveryPage = () => {
                 <Plug className="w-5 h-5" />
                 Modbus Devices
               </span>
-              <Badge variant="outline">
-                {modbusResult.devices.length} device(s) found
-              </Badge>
+              <div className="flex items-center gap-2">
+                {modbusResult.verified_count > 0 && (
+                  <Badge className="bg-green-500/20 text-green-600">
+                    <ShieldCheck className="w-3 h-3 mr-1" />
+                    {modbusResult.verified_count} verified
+                  </Badge>
+                )}
+                <Badge variant="outline">
+                  {modbusResult.devices.length} device(s) found
+                </Badge>
+              </div>
             </CardTitle>
           </CardHeader>
           <CardContent>
             <div className="mb-4 text-sm text-muted-foreground">
               Your IP: <span className="font-mono text-foreground">{modbusResult.local_ip}</span>
-              {' | '}Port scanned: <span className="font-mono text-foreground">{modbusResult.port_scanned}</span>
+              {' | '}Ports scanned: <span className="font-mono text-foreground">{modbusResult.ports_scanned?.join(', ') || modbusResult.port_scanned}</span>
               {' | '}Scanned at: {new Date(modbusResult.scanned_at).toLocaleTimeString()}
             </div>
 
             {modbusResult.devices.length === 0 ? (
               <div className="text-center py-8 text-muted-foreground">
                 <XCircle className="w-12 h-12 mx-auto mb-3 opacity-50" />
-                <p className="font-medium">No Modbus devices found on port {modbusResult.port_scanned}</p>
-                <p className="text-sm mt-1">Make sure the Modbus slave is running on the client laptop</p>
+                <p className="font-medium">No Modbus devices found</p>
+                <p className="text-sm mt-1">Make sure the Modbus slave is running and accessible</p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -195,29 +241,61 @@ export const NetworkDiscoveryPage = () => {
                     key={idx}
                     className={cn(
                       "p-4 rounded-lg border flex items-center justify-between",
-                      device.is_self ? "border-primary bg-primary/5" : "border-green-500 bg-green-500/5"
+                      device.is_self ? "border-primary bg-primary/5" : 
+                      device.verified ? "border-green-500 bg-green-500/5" : "border-yellow-500 bg-yellow-500/5"
                     )}
                     data-testid={`modbus-device-${idx}`}
                   >
                     <div className="flex items-center gap-4">
                       <div className={cn(
                         "p-3 rounded-full",
-                        device.is_self ? "bg-primary/20" : "bg-green-500/20"
+                        device.is_self ? "bg-primary/20" : 
+                        device.verified ? "bg-green-500/20" : "bg-yellow-500/20"
                       )}>
-                        <Plug className={cn("w-6 h-6", device.is_self ? "text-primary" : "text-green-500")} />
+                        <Plug className={cn("w-6 h-6", 
+                          device.is_self ? "text-primary" : 
+                          device.verified ? "text-green-500" : "text-yellow-500"
+                        )} />
                       </div>
                       <div>
                         <div className="flex items-center gap-2">
                           <span className="font-mono text-lg font-semibold">{device.ip}</span>
+                          {device.hostname && <span className="text-sm text-muted-foreground">({device.hostname})</span>}
                           {device.is_self && <Badge className="bg-primary/20 text-primary text-xs">This PC</Badge>}
-                          <Badge className="bg-green-500/20 text-green-600 text-xs">Modbus TCP</Badge>
+                          {device.verified ? (
+                            <Badge className="bg-green-500/20 text-green-600 text-xs">
+                              <ShieldCheck className="w-3 h-3 mr-1" />
+                              Verified Modbus
+                            </Badge>
+                          ) : (
+                            <Badge className="bg-yellow-500/20 text-yellow-600 text-xs">TCP Open</Badge>
+                          )}
                         </div>
                         <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground">
                           <span>Port: {device.port}</span>
+                          {device.unit_ids?.length > 0 && (
+                            <span>Unit IDs: {device.unit_ids.join(', ')}</span>
+                          )}
                         </div>
                       </div>
                     </div>
-                    {!device.is_self && (
+                    <div className="flex items-center gap-2">
+                      {!device.is_self && currentProject && (
+                        <Button
+                          variant="default"
+                          size="sm"
+                          onClick={() => handleAddDevice(device)}
+                          disabled={addingDevice === device.ip}
+                          data-testid={`add-device-${idx}`}
+                        >
+                          {addingDevice === device.ip ? (
+                            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          ) : (
+                            <Plus className="w-4 h-4 mr-2" />
+                          )}
+                          Add to Project
+                        </Button>
+                      )}
                       <Button
                         variant="outline"
                         size="sm"
@@ -227,22 +305,29 @@ export const NetworkDiscoveryPage = () => {
                         <Copy className="w-4 h-4 mr-2" />
                         Copy IP
                       </Button>
-                    )}
+                    </div>
                   </div>
                 ))}
               </div>
             )}
 
+            {!currentProject && modbusResult.devices.filter(d => !d.is_self).length > 0 && (
+              <div className="mt-4 p-4 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-sm">
+                <p className="font-medium mb-1 text-yellow-700">Select a project to add devices</p>
+                <p className="text-muted-foreground">Use the project selector in the sidebar to add discovered devices directly.</p>
+              </div>
+            )}
+
             {modbusResult.devices.filter(d => !d.is_self).length > 0 && (
               <div className="mt-4 p-4 rounded-lg bg-green-500/10 border border-green-500/20 text-sm">
-                <p className="font-medium mb-1 text-green-700">To connect to this Modbus device:</p>
+                <p className="font-medium mb-1 text-green-700">To connect to a Modbus device manually:</p>
                 <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
                   <li>Go to <strong>Devices</strong> page</li>
-                  <li>Click <strong>+ New Device</strong></li>
+                  <li>Click <strong>+ Add Device</strong></li>
                   <li>Set Protocol: <strong>TCP</strong></li>
                   <li>Set IP: <strong>{modbusResult.devices.find(d => !d.is_self)?.ip}</strong></li>
-                  <li>Set Port: <strong>{modbusResult.port_scanned}</strong></li>
-                  <li>Set Unit ID: <strong>1</strong></li>
+                  <li>Set Port: <strong>{modbusResult.devices.find(d => !d.is_self)?.port}</strong></li>
+                  <li>Set Unit ID: <strong>{modbusResult.devices.find(d => !d.is_self)?.unit_ids?.[0] || 1}</strong></li>
                 </ol>
               </div>
             )}
